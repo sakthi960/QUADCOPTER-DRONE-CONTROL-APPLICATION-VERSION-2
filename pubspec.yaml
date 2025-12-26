@@ -1,0 +1,55 @@
+name: esp32_drone_control
+description: ESP32 Drone Control Application with Real-time Telemetry
+
+# Prevent publishing to pub.dev
+publish_to: 'none'
+
+# App version
+version: 1.0.0+1
+
+# SDK constraints
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+# Dependencies
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # HTTP requests for ESP32 communication
+  http: ^1.1.0
+  
+  # Local storage for settings persistence
+  shared_preferences: ^2.2.2
+  
+  # Material Design icons
+  cupertino_icons: ^1.0.6
+  sensors_plus: ^7.0.0
+
+# Development dependencies
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  # Linting rules
+  flutter_lints: ^3.0.0
+
+  # App icon generation
+  flutter_launcher_icons: ^0.13.1
+
+# Flutter configuration
+flutter:
+  uses-material-design: true
+
+  # Uncomment to add assets
+  # assets:
+  #   - images/
+  #   - assets/
+
+  # Uncomment to add custom fonts
+  # fonts:
+  #   - family: CustomFont
+  #     fonts:
+  #       - asset: fonts/CustomFont-Regular.ttf
+  #       - asset: fonts/CustomFont-Bold.ttf
+  #         weight: 700
