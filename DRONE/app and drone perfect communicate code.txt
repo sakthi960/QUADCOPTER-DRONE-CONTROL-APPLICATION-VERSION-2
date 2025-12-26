@@ -1,0 +1,363 @@
+// ================= FIXED ESP32 DRONE CODE =================
+// FIXES APPLIED:
+// 1. UDP Port now matches Flutter app (8888)
+// 2. Clear step-by-step serial status messages
+// 3. ARM state properly tracked and displayed
+// 4. Connection status monitoring
+// 5. Shows "NOT CONNECTED" when app is disconnected
+// ===========================================================
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPS++.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+
+// ---------------- CONFIG ----------------
+#define UDP_PORT 8888  // MUST MATCH FLUTTER APP PORT
+#define MOTOR_IDLE 1100
+#define MOTOR_MIN 1000
+#define MOTOR_MAX 2000
+
+#define MOTOR_FL 27
+#define MOTOR_FR 25
+#define MOTOR_RL 26
+#define MOTOR_RR 14
+
+#define TRIG_PIN 13
+#define ECHO_PIN 12
+#define GPS_RX 16
+#define GPS_TX 17
+
+const char* ssid = "Drone_Medical_01";
+const char* password = "health123";
+
+// ---------------- OBJECTS ----------------
+WiFiUDP udp;
+Servo escFL, escFR, escRL, escRR;
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+// ---------------- STATES ----------------
+enum FlightMode { DISARMED, ARMED, EMERGENCY };
+FlightMode currentMode = DISARMED;
+
+// ---------------- CONTROL ----------------
+int throttleIn = 1000, rollIn = 1500, pitchIn = 1500, yawIn = 1500;
+int armIn = 0, previousArmIn = 0;
+unsigned long lastPacketTime = 0;
+bool appConnected = false;
+unsigned long packetCount = 0;
+
+// ---------------- MOTOR ----------------
+int m1=1000, m2=1000, m3=1000, m4=1000;
+
+// ---------------- SENSOR ----------------
+float roll=0, pitch=0, altitude=0;
+bool mpuOK=false;
+
+// ---------------- FUNCTION PROTOTYPES ----------------
+void receiveUDP();
+void serialArmControl();
+void mixMotors();
+void setMotors(int fl,int fr,int rl,int rr);
+void readIMU();
+void readUltrasonic();
+void debugPrint();
+
+// =============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n");
+  Serial.println("╔════════════════════════════════════════╗");
+  Serial.println("║    ESP32 DRONE FLIGHT CONTROLLER      ║");
+  Serial.println("║          Version 3.0                  ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  Serial.println();
+
+  // Step 1: Initialize I2C
+  Serial.print("[STEP 1] Initializing I2C... ");
+  Wire.begin(21, 22);
+  Serial.println("✓ DONE");
+
+  // Step 2: Initialize WiFi Access Point
+  Serial.print("[STEP 2] Starting WiFi AP... ");
+  WiFi.softAP(ssid, password);
+  Serial.println("✓ DONE");
+  Serial.print("         SSID: ");
+  Serial.println(ssid);
+  Serial.print("         IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("         Password: ");
+  Serial.println(password);
+
+  // Step 3: Initialize UDP
+  Serial.print("[STEP 3] Starting UDP on port ");
+  Serial.print(UDP_PORT);
+  Serial.print("... ");
+  udp.begin(UDP_PORT);
+  Serial.println("✓ DONE");
+
+  // Step 4: Initialize ESCs
+  Serial.print("[STEP 4] Initializing ESCs... ");
+  escFL.attach(MOTOR_FL, MOTOR_MIN, MOTOR_MAX);
+  escFR.attach(MOTOR_FR, MOTOR_MIN, MOTOR_MAX);
+  escRL.attach(MOTOR_RL, MOTOR_MIN, MOTOR_MAX);
+  escRR.attach(MOTOR_RR, MOTOR_MIN, MOTOR_MAX);
+  setMotors(MOTOR_MIN, MOTOR_MIN, MOTOR_MIN, MOTOR_MIN);
+  delay(500); // ESC calibration delay
+  Serial.println("✓ DONE");
+
+  // Step 5: Initialize MPU6050
+  Serial.print("[STEP 5] Initializing MPU6050... ");
+  mpuOK = mpu.begin();
+  if (mpuOK) {
+    Serial.println("✓ DONE");
+  } else {
+    Serial.println("✗ FAILED (continuing without IMU)");
+  }
+
+  // Step 6: Initialize GPS
+  Serial.print("[STEP 6] Initializing GPS... ");
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("✓ DONE");
+
+  // Step 7: Initialize Ultrasonic
+  Serial.print("[STEP 7] Initializing Ultrasonic... ");
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  Serial.println("✓ DONE");
+
+  // Ready
+  Serial.println();
+  Serial.println("╔════════════════════════════════════════╗");
+  Serial.println("║   ✓ SYSTEM READY - WAITING FOR APP    ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  Serial.println();
+  Serial.println("[STATUS] Motors: DISARMED (ARM = 0)");
+  Serial.println("[STATUS] Mode: WAITING FOR CONNECTION");
+  Serial.println();
+  Serial.println("────────────────────────────────────────");
+  Serial.println("Connect your Flutter app to:");
+  Serial.print("  • WiFi: ");
+  Serial.println(ssid);
+  Serial.print("  • IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("  • UDP Port: ");
+  Serial.println(UDP_PORT);
+  Serial.println("────────────────────────────────────────");
+  Serial.println();
+}
+
+// =============================================================
+void loop() {
+  receiveUDP();
+  serialArmControl();
+
+  // ARM / DISARM state change detection
+  if (armIn != previousArmIn) {
+    if (armIn == 1 && throttleIn < 1050) {
+      currentMode = ARMED;
+      Serial.println();
+      Serial.println("╔════════════════════════════════════════╗");
+      Serial.println("║       ⚠ MOTORS ARMED ⚠                ║");
+      Serial.println("╚════════════════════════════════════════╝");
+      Serial.println("[ARM STATE] ARM = 1 ✓");
+      Serial.println("[WARNING] Motors will spin when throttle increases!");
+      Serial.println();
+    } else if (armIn == 0) {
+      currentMode = DISARMED;
+      Serial.println();
+      Serial.println("╔════════════════════════════════════════╗");
+      Serial.println("║      ✓ MOTORS DISARMED ✓              ║");
+      Serial.println("╚════════════════════════════════════════╝");
+      Serial.println("[ARM STATE] ARM = 0");
+      Serial.println("[STATUS] Motors stopped - Safe to handle");
+      Serial.println();
+    } else if (armIn == 1 && throttleIn >= 1050) {
+      Serial.println();
+      Serial.println("[ARM REJECTED] ✗ Cannot arm - Throttle too high!");
+      Serial.println("[SAFETY] Lower throttle below 1050 to arm");
+      armIn = 0; // Force disarm
+      Serial.println();
+    }
+    previousArmIn = armIn;
+  }
+
+  // FAILSAFE - Connection lost
+  if (appConnected && (millis() - lastPacketTime > 1000)) {
+    Serial.println();
+    Serial.println("╔════════════════════════════════════════╗");
+    Serial.println("║    ✗ APP DISCONNECTED ✗               ║");
+    Serial.println("╚════════════════════════════════════════╝");
+    
+    if (armIn == 1) {
+      Serial.println("[FAILSAFE] Signal lost - Auto disarming!");
+      armIn = 0;
+      setMotors(MOTOR_MIN, MOTOR_MIN, MOTOR_MIN, MOTOR_MIN);
+      Serial.println("[STATUS] Motors stopped");
+    }
+    
+    Serial.println("[STATUS] Drone NOT connected to app");
+    Serial.println();
+    appConnected = false;
+    packetCount = 0;
+  }
+
+  // MOTOR CONTROL
+  if (armIn == 1) {
+    mixMotors();
+  } else {
+    setMotors(MOTOR_MIN, MOTOR_MIN, MOTOR_MIN, MOTOR_MIN);
+  }
+
+  readIMU();
+  readUltrasonic();
+  debugPrint();
+  
+  delay(10);
+}
+
+// =============================================================
+void receiveUDP() {
+  int packetSize = udp.parsePacket();
+  if (!packetSize) return;
+
+  // First packet received
+  if (!appConnected) {
+    appConnected = true;
+    Serial.println();
+    Serial.println("╔════════════════════════════════════════╗");
+    Serial.println("║     ✓ APP CONNECTED ✓                 ║");
+    Serial.println("╚════════════════════════════════════════╝");
+    Serial.print("[CONNECTION] Remote IP: ");
+    Serial.println(udp.remoteIP());
+    Serial.print("[CONNECTION] Remote Port: ");
+    Serial.println(udp.remotePort());
+    Serial.println("[STATUS] Receiving control packets...");
+    Serial.println();
+  }
+
+  char buf[64];
+  int len = udp.read(buf, 64);
+  buf[len] = '\0';
+
+  // Parse packet: THROTTLE,ROLL,PITCH,YAW,ARM
+  int parsed = sscanf(buf, "%d,%d,%d,%d,%d", 
+                      &throttleIn, &rollIn, &pitchIn, &yawIn, &armIn);
+  
+  if (parsed == 5) {
+    lastPacketTime = millis();
+    packetCount++;
+  } else {
+    Serial.print("[ERROR] Invalid packet format: ");
+    Serial.println(buf);
+  }
+}
+
+// =============================================================
+void serialArmControl() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  
+  if (c == 'a' || c == 'A') {
+    Serial.println("[SERIAL CMD] ARM command received");
+    armIn = 1;
+  }
+  if (c == 'd' || c == 'D') {
+    Serial.println("[SERIAL CMD] DISARM command received");
+    armIn = 0;
+  }
+}
+
+// =============================================================
+void mixMotors() {
+  int rd = rollIn - 1500;
+  int pd = pitchIn - 1500;
+  int yd = yawIn - 1500;
+
+  m1 = constrain(throttleIn + pd + rd - yd, MOTOR_IDLE, MOTOR_MAX);
+  m2 = constrain(throttleIn + pd - rd + yd, MOTOR_IDLE, MOTOR_MAX);
+  m3 = constrain(throttleIn - pd - rd - yd, MOTOR_IDLE, MOTOR_MAX);
+  m4 = constrain(throttleIn - pd + rd + yd, MOTOR_IDLE, MOTOR_MAX);
+
+  setMotors(m1, m2, m3, m4);
+}
+
+// =============================================================
+void setMotors(int fl, int fr, int rl, int rr) {
+  escFL.writeMicroseconds(fl);
+  escFR.writeMicroseconds(fr);
+  escRL.writeMicroseconds(rl);
+  escRR.writeMicroseconds(rr);
+}
+
+// =============================================================
+void readIMU() {
+  if (!mpuOK) return;
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+  roll = atan2(a.acceleration.y, a.acceleration.z) * 180 / PI;
+  pitch = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + 
+                                        a.acceleration.z * a.acceleration.z)) * 180 / PI;
+}
+
+// =============================================================
+void readUltrasonic() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long d = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (d > 0) altitude = d * 0.034 / 2;
+}
+
+// =============================================================
+void debugPrint() {
+  static unsigned long lastPrint = 0;
+  
+  if (millis() - lastPrint < 1000) return; // Print every 1 second
+  lastPrint = millis();
+
+  // If NOT connected, show waiting message
+  if (!appConnected) {
+    Serial.println("⏳ WAITING FOR APP CONNECTION...");
+    Serial.println("   Status: DRONE NOT CONNECTED TO APP");
+    Serial.println();
+    return;
+  }
+
+  // If connected, show live data
+  String armStatus = (armIn == 1) ? "ARMED ⚠" : "DISARMED ✓";
+  
+  Serial.print("[CONNECTED] [");
+  Serial.print(armStatus);
+  Serial.print("] THR:");
+  Serial.print(throttleIn);
+  Serial.print(" R:");
+  Serial.print(rollIn);
+  Serial.print(" P:");
+  Serial.print(pitchIn);
+  Serial.print(" Y:");
+  Serial.print(yawIn);
+  Serial.print(" | Motors[FL:");
+  Serial.print(m1);
+  Serial.print(" FR:");
+  Serial.print(m2);
+  Serial.print(" RL:");
+  Serial.print(m3);
+  Serial.print(" RR:");
+  Serial.print(m4);
+  Serial.print("] | ALT:");
+  Serial.print(altitude, 1);
+  Serial.print("cm | PKT#:");
+  Serial.println(packetCount);
+}
